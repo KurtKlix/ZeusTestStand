@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-Command cargo -ErrorAction SilentlyContinue; if \\(-not $?\\) { Get-ChildItem \"$env:USERPROFILE\\\\.cargo\\\\bin\\\\cargo.exe\" -ErrorAction SilentlyContinue })",
+      "PowerShell(Get-ChildItem \"$env:USERPROFILE\\\\.cargo\\\\bin\\\\\" -ErrorAction SilentlyContinue | Select-Object -First 10)",
+      "PowerShell(New-Item -ItemType Directory -Path \"z:\\\\Projects\\\\ZeusTestStand\\\\stepper-control\\\\src\" -Force)",
+      "PowerShell(Get-ChildItem -Path \"z:\\\\Projects\\\\ZeusTestStand\" -Recurse | Where-Object { -not $_.PSIsContainer } | Select-Object -First 50 Name, @{N='Type';E={$_.Extension}} | Format-Table)",
+      "PowerShell(Get-ChildItem -Path \"z:\\\\Projects\\\\ZeusTestStand\" -Recurse -File | Where-Object { $_.Extension -match '\\\\.\\(md|txt|cfg|conf|yaml|yml\\)$' } | Select-Object FullName)",
+      "PowerShell(gh --version)",
+      "PowerShell(gh auth status)"
+    ]
+  }
+}
