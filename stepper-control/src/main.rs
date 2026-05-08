@@ -1,9 +1,10 @@
 #![windows_subsystem = "windows"]
 
 use eframe::egui::{self, Color32, RichText, ScrollArea};
+use rfd::FileDialog;
 use serialport::SerialPort;
 use std::io::{self, BufRead, BufReader, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver},
@@ -127,6 +128,24 @@ impl Default for StepperApp {
             macro_edit_gcode: String::new(),
         }
     }
+}
+
+fn find_pio() -> Option<std::path::PathBuf> {
+    if Command::new("pio").arg("--version").output().is_ok() {
+        return Some(std::path::PathBuf::from("pio"));
+    }
+    #[cfg(windows)]
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        let p = std::path::PathBuf::from(home)
+            .join(".platformio")
+            .join("penv")
+            .join("Scripts")
+            .join("pio.exe");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
 }
 
 fn parse_axis_value(line: &str, axis: char) -> Option<f32> {
@@ -585,37 +604,72 @@ impl StepperApp {
         self.compiling = true;
 
         std::thread::spawn(move || {
+            let pio = match find_pio() {
+                Some(p) => p,
+                None => {
+                    let _ = tx.send(
+                        "[pio] Error: pio not found. Install PlatformIO Core or add it to PATH."
+                            .to_string(),
+                    );
+                    let _ = tx.send(
+                        "[pio] Typical Windows location: %USERPROFILE%\\.platformio\\penv\\Scripts\\pio.exe"
+                            .to_string(),
+                    );
+                    let _ = tx.send("\x00DONE".to_string());
+                    return;
+                }
+            };
+
+            let _ = tx.send(format!("[pio] Using: {}", pio.display()));
             let _ = tx.send("[pio] Starting PlatformIO compile & upload...".to_string());
-            match Command::new("pio")
+
+            let child = Command::new(&pio)
                 .args(["run", "--target", "upload"])
                 .current_dir(&dir)
-                .output()
-            {
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+
+            match child {
                 Err(e) => {
                     let _ = tx.send(format!("[pio] Failed to launch pio: {e}"));
-                    let _ = tx
-                        .send("[pio] Is PlatformIO Core installed and in PATH?".to_string());
+                    let _ = tx.send("\x00DONE".to_string());
                 }
-                Ok(out) => {
-                    for line in String::from_utf8_lossy(&out.stdout).lines() {
-                        if !line.trim().is_empty() {
-                            let _ = tx.send(format!("[pio] {line}"));
+                Ok(mut child) => {
+                    if let Some(stdout) = child.stdout.take() {
+                        let tx2 = tx.clone();
+                        std::thread::spawn(move || {
+                            for line in BufReader::new(stdout).lines().flatten() {
+                                if !line.trim().is_empty() {
+                                    let _ = tx2.send(format!("[pio] {line}"));
+                                }
+                            }
+                        });
+                    }
+                    if let Some(stderr) = child.stderr.take() {
+                        let tx3 = tx.clone();
+                        std::thread::spawn(move || {
+                            for line in BufReader::new(stderr).lines().flatten() {
+                                if !line.trim().is_empty() {
+                                    let _ = tx3.send(format!("[pio] {line}"));
+                                }
+                            }
+                        });
+                    }
+                    match child.wait() {
+                        Ok(status) if status.success() => {
+                            let _ = tx.send("[pio] ✓ Flash complete.".to_string());
+                        }
+                        Ok(status) => {
+                            let _ = tx.send(format!("[pio] ✗ Build failed (exit {}).", status));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(format!("[pio] Error waiting for process: {e}"));
                         }
                     }
-                    for line in String::from_utf8_lossy(&out.stderr).lines() {
-                        if !line.trim().is_empty() {
-                            let _ = tx.send(format!("[pio] {line}"));
-                        }
-                    }
-                    if out.status.success() {
-                        let _ = tx.send("[pio] ✓ Flash complete.".to_string());
-                    } else {
-                        let _ =
-                            tx.send(format!("[pio] ✗ Build failed (exit {}).", out.status));
-                    }
+                    let _ = tx.send("\x00DONE".to_string());
                 }
             }
-            let _ = tx.send("\x00DONE".to_string());
         });
     }
 
@@ -1025,8 +1079,13 @@ impl StepperApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.firmware_dir)
                         .hint_text("C:\\path\\to\\Marlin-firmware")
-                        .desired_width(300.0),
+                        .desired_width(260.0),
                 );
+                if ui.button("Browse…").clicked() {
+                    if let Some(path) = FileDialog::new().pick_folder() {
+                        self.firmware_dir = path.to_string_lossy().to_string();
+                    }
+                }
             });
             if !self.firmware_dir.is_empty() {
                 ui.label(
@@ -1212,23 +1271,30 @@ impl StepperApp {
             );
             ui.add_space(8.0);
 
-            let can_flash = !self.firmware_dir.trim().is_empty() && !self.compiling;
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(can_flash, |ui| {
-                    if ui.button("Write Header Only").clicked() {
-                        self.write_zeus_h();
-                        self.patch_configuration_h();
-                    }
-                    if ui.button("Compile & Flash  ⚡").clicked() {
-                        self.compile_and_flash();
-                    }
-                });
-                if self.compiling {
-                    ui.label(
-                        RichText::new("Compiling… see log below").color(Color32::YELLOW),
-                    );
+        let can_flash = !self.firmware_dir.trim().is_empty() && !self.compiling;
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(can_flash, |ui| {
+                if ui.button("Write Header Only").clicked() {
+                    self.write_zeus_h();
+                    self.patch_configuration_h();
+                }
+                if ui.button("Compile & Flash  ⚡").clicked() {
+                    self.compile_and_flash();
                 }
             });
+            if self.firmware_dir.trim().is_empty() {
+                ui.label(
+                    RichText::new("← Set firmware directory first")
+                        .color(Color32::YELLOW)
+                        .small(),
+                );
+            }
+            if self.compiling {
+                ui.label(
+                    RichText::new("Compiling… see log below").color(Color32::YELLOW),
+                );
+            }
+        });
         });
 
         ui.add_space(8.0);
